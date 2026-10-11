@@ -1,0 +1,449 @@
+-- ЧАСТЬ 1/3
+loadstring(game:HttpGet("https://raw.githubusercontent.com/artem2026gf-cmd/Gui/refs/heads/main/Fixing%200%2C1%20version"))()
+task.wait(2.5)
+
+local M = _G.AmodM
+if not M then warn("[A-mod] гуи не загрузилось") return end
+
+-- Оставляем только Combat
+M.TAB_NAMES = { "Combat" }
+for i = #M.tabButtons, 2, -1 do
+    if M.tabButtons[i] then pcall(function() M.tabButtons[i]:Destroy() end) M.tabButtons[i] = nil end
+    if M.tabIcons[i] and M.tabIcons[i].holder then pcall(function() M.tabIcons[i].holder:Destroy() end) end
+    M.tabIcons[i] = nil
+end
+for i = 2, 7 do
+    if M.pageList and M.pageList[i] then pcall(function() M.pageList[i]:Destroy() end) M.pageList[i] = nil end
+end
+M.currentTab = 1
+M.onTabSelected = function() end
+if M.highlight then M.highlight.Position = UDim2.fromOffset(2, 2) end
+
+-- Чистим тестовые панели
+local pg = M.pageList[1]
+for _, ch in ipairs(pg:GetChildren()) do
+    if ch:IsA("Frame") and ch.Name ~= "PageTitle" then
+        ch:Destroy()
+    end
+end
+for _, ch in ipairs(pg:GetChildren()) do
+    if ch:IsA("TextLabel") and ch.Name == "PageTitle" then
+        ch.Text = "Combat"
+    end
+end
+
+_G.AmodPG = pg
+print("[A-mod 1/3] гуи загружено, вкладки почищены")
+-- ЧАСТЬ 2/3
+local pg = _G.AmodPG
+local M = _G.AmodM
+if not pg or not M then warn("[A-mod] сначала часть 1") return end
+
+local P   = game:GetService("Players")
+local RS  = game:GetService("ReplicatedStorage")
+local W   = workspace
+local LP  = P.LocalPlayer
+local Cam = W.CurrentCamera
+local R   = game:GetService("RunService")
+
+local CFG = _G.CFG or {
+    SilentAim = false, FOV = 180, MaxDist = 2000, TeamCheck = true,
+    DrawFov = true, FovColor = Color3.fromRGB(255,80,120),
+    SwitchInterval = 0.1, DeathCheck = true, DistancePriority = true,
+    NoRecoil = false, NoSpread = false, InstantReload = false,
+    Chams = false, ChamsColor = Color3.fromRGB(0,255,0), ChamsTransparency = 0.5,
+}
+_G.CFG = CFG
+
+--=== ЛОГИКА ===--
+local Cheat = {}
+_G.AmodCheat = Cheat
+
+local function hasVest(c)
+    if not c then return false end
+    local a = c:FindFirstChild("CharacterArmor")
+    return a and a:FindFirstChild("VestDetails") ~= nil
+end
+local function isEnemy(pl, ch)
+    if not CFG.TeamCheck then return true end
+    local me = LP.Character
+    if not me then return false end
+    local mv, hv = hasVest(me), hasVest(ch)
+    if mv ~= hv then return true end
+    if not mv and not hv then
+        local mt = LP.Team and LP.Team.Name
+        local ht = pl and pl.Team and pl.Team.Name
+        if mt and ht and mt ~= ht then return true end
+    end
+    return false
+end
+local function isAlive(c)
+    if not c or not c.Parent then return false end
+    if not CFG.DeathCheck then return true end
+    if c:GetAttribute("Dead") == true then return false end
+    local hp = c:GetAttribute("Health")
+    if type(hp) == "number" and hp <= 0 then return false end
+    local hu = c:FindFirstChildOfClass("Humanoid")
+    if hu and (hu.Health <= 0 or hu:GetState() == Enum.HumanoidStateType.Dead) then return false end
+    return c:FindFirstChild("Head") ~= nil
+end
+
+local GetRI, RCast, RCastThr
+pcall(function() GetRI = require(RS.Components.Common.GetRayIgnore) end)
+pcall(function() local RC = require(RS.Shared.Raycast); RCast = RC.cast; RCastThr = RC.castThrough end)
+
+local function pickPart(ch)
+    for _, n in ipairs({"Head","UpperTorso","Torso","LowerTorso","HumanoidRootPart"}) do
+        local p = ch:FindFirstChild(n)
+        if p and p:IsA("BasePart") then return p end
+    end
+end
+
+local CurCh, CurPart = nil, nil
+local TList, TIdx, LastSw = {}, 0, 0
+
+local function getAng(p)
+    local cp = Cam.CFrame.Position
+    local cl = Cam.CFrame.LookVector
+    local d = p - cp
+    local m = d.Magnitude
+    if m < 0.001 then return 0 end
+    return math.deg(math.acos(math.clamp(cl:Dot(d/m), -1, 1)))
+end
+
+local function collect()
+    local l = {}
+    local cf = W:FindFirstChild("Characters")
+    if not cf then return l end
+    for _, ch in ipairs(cf:GetChildren()) do
+        if ch:IsA("Model") and ch.Name ~= LP.Name and isAlive(ch) then
+            local pl = P:FindFirstChild(ch.Name)
+            if isEnemy(pl, ch) then
+                local head = ch:FindFirstChild("Head")
+                if head and head:IsA("BasePart") then
+                    local d = (head.Position - Cam.CFrame.Position).Magnitude
+                    if d <= CFG.MaxDist then
+                        local a = getAng(head.Position)
+                        if CFG.FOV >= 180 or a <= CFG.FOV then
+                            local part = pickPart(ch)
+                            if part then table.insert(l, {char=ch, head=head, part=part, angle=a, dist=d}) end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if CFG.DistancePriority then
+        table.sort(l, function(a,b) return a.dist < b.dist end)
+    else
+        table.sort(l, function(a,b) return a.angle < b.angle end)
+    end
+    return l
+end
+
+local function updT()
+    if not CFG.SilentAim then CurCh = nil CurPart = nil return end
+    local now = os.clock()
+    TList = collect()
+    if #TList == 0 then CurCh = nil CurPart = nil TIdx = 0 return end
+    if now - LastSw >= CFG.SwitchInterval or TIdx == 0 then
+        LastSw = now
+        TIdx = TIdx + 1
+        if TIdx > #TList then TIdx = 1 end
+    end
+    if TIdx > #TList then TIdx = 1 end
+    local ch = TList[TIdx]
+    if not ch or not ch.char or not ch.char.Parent then TIdx = 1; ch = TList[1] end
+    if ch then CurCh = ch.char; CurPart = ch.part end
+end
+
+local origRC, silentInstalled = nil, false
+function Cheat.InstallSilent()
+    if silentInstalled then return true end
+    local bm = RS.Components and RS.Components.Weapon and RS.Components.Weapon:FindFirstChild("Classes")
+        and RS.Components.Weapon.Classes:FindFirstChild("Bullet")
+    if not bm then return false end
+    local ok, B = pcall(require, bm)
+    if not ok or type(B) ~= "table" or type(B._performRaycast) ~= "function" then return false end
+    origRC = B._performRaycast
+    B._performRaycast = function(self, spread)
+        if not CFG.SilentAim then
+            if origRC then return origRC(self, spread) end
+        end
+        local tp = CurPart
+        if tp and tp.Parent then
+            local ch = tp.Parent
+            if ch and isAlive(ch) then
+                local ok2, res = pcall(function()
+                    local ig = GetRI and GetRI() or {LP.Character, Cam}
+                    local vp = Cam.ViewportSize
+                    local ray = Cam:ViewportPointToRay(vp.X*0.5, vp.Y*0.5)
+                    local O = ray.Origin
+                    local Pt = tp.Position
+                    local D = (Pt - O).Unit
+                    local tot = (Pt - O).Magnitude
+                    local rng = math.max((self.Properties and self.Properties.Range) or 500, tot+50)
+                    local pen = (self.Properties and self.Properties.Penetration) or 0
+                    local hd = {Distance = tot, Origin = O, Direction = D, Hits = {}}
+                    if RCast and RCastThr then
+                        local hi = RCast(O, D*rng, nil, ig)
+                        if hi and hi.instance then
+                            local hp = hi.position
+                            hd.Distance = (hp - O).Magnitude
+                            local ph = RCastThr(hp + D*-0.001, D*(pen+0.001), pen, ig)
+                            if ph then
+                                for i = 1, #ph do
+                                    local p = ph[i]
+                                    if p.instance and p.material then
+                                        table.insert(hd.Hits, {
+                                            Position = p.position, Instance = p.instance,
+                                            Material = (p.material and p.material.Name) or tostring(p.material),
+                                            Normal = p.normal or Vector3.new(0,0,0), Exit = (i%2==0)
+                                        })
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    return hd
+                end)
+                if ok2 and res and res.Hits then return res end
+            end
+        end
+        if origRC then return origRC(self, spread) end
+    end
+    silentInstalled = true
+    return true
+end
+
+local recoilState = { installed = false, cc = nil }
+function Cheat.InstallNoRecoil()
+    if recoilState.installed then return true end
+    local ZERO = Vector3.new()
+    local cc
+    for _, m in ipairs(getloadedmodules()) do
+        local ok, r = pcall(require, m)
+        if ok and type(r) == "table" and type(r.setWeaponRecoil) == "function" and type(r.weaponKick) == "function" then
+            cc = r break
+        end
+    end
+    if not cc then return false end
+    local gu = getupvalue or debug.getupvalue
+    local function hook(s, m)
+        if type(s) ~= "table" then return end
+        local o = s[m]
+        if type(o) == "function" then
+            s[m] = function(self, a, ...)
+                if CFG.NoRecoil then return o(self, ZERO, ...) end
+                return o(self, a, ...)
+            end
+        end
+    end
+    local up1 = gu(cc.setWeaponRecoil, 1)
+    if up1 then hook(up1, "setGoal") end
+    for u = 1, 2 do
+        local sp = gu(cc.weaponKick, u)
+        if sp then hook(sp, "setPosition"); hook(sp, "setGoal"); hook(sp, "impulse") end
+    end
+    recoilState.cc = cc
+    recoilState.installed = true
+    return true
+end
+
+local spreadState = { installed = false }
+function Cheat.InstallNoSpread()
+    if spreadState.installed then return true end
+    if typeof(getgc) ~= "function" then return false end
+    for _, o in pairs(getgc(true)) do
+        if type(o) == "table" and type(rawget(o, "getTrueSpread")) == "function" then
+            local old = rawget(o, "getTrueSpread")
+            rawset(o, "getTrueSpread", function(...)
+                if CFG.NoSpread then return 0 end
+                return old(...)
+            end)
+            spreadState.installed = true
+            return true
+        end
+    end
+    return false
+end
+
+local reloadState = { installed = false }
+function Cheat.InstallInstantReload()
+    if reloadState.installed then return true end
+    if typeof(getgc) ~= "function" then return false end
+    for _, o in pairs(getgc(true)) do
+        if type(o) == "table" and type(rawget(o, "play")) == "function" then
+            local old = rawget(o, "play")
+            rawset(o, "play", function(self, name, ...)
+                local t = old(self, name, ...)
+                if t and CFG.InstantReload and (name == "Reload" or name == "ReloadStart" or name == "ReloadAction" or name == "ReloadEnd") then
+                    task.defer(function() pcall(function() if t.IsPlaying then t:AdjustSpeed(199) end end) end)
+                end
+                return t
+            end)
+            reloadState.installed = true
+            return true
+        end
+    end
+    return false
+end
+
+-- FOV circle
+local Fov
+if Drawing and Drawing.new then
+    Fov = Drawing.new("Circle")
+    Fov.NumSides = 64 Fov.Thickness = 1.5 Fov.Filled = false Fov.Transparency = 0.8 Fov.Color = CFG.FovColor
+end
+
+-- Chams
+local ChamsCache = setmetatable({}, {__mode = "k"})
+local function updateChams(ch, on)
+    if not CFG.Chams or not on then
+        local c = ChamsCache[ch]
+        if c and c.Enabled then c.Enabled = false end
+        return
+    end
+    local c = ChamsCache[ch]
+    if not c or not c.Parent then
+        if c then pcall(function() c:Destroy() end) end
+        local hl = Instance.new("Highlight")
+        hl.FillTransparency = CFG.ChamsTransparency
+        hl.OutlineTransparency = 0
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.FillColor = CFG.ChamsColor
+        hl.OutlineColor = CFG.ChamsColor
+        hl.Adornee = ch
+        hl.Parent = W
+        ChamsCache[ch] = hl
+    else
+        c.FillColor = CFG.ChamsColor
+        c.OutlineColor = CFG.ChamsColor
+        c.FillTransparency = CFG.ChamsTransparency
+        c.Adornee = ch
+        c.Enabled = true
+    end
+end
+
+-- main loop
+R.RenderStepped:Connect(function()
+    pcall(function()
+        if not Cam then Cam = W.CurrentCamera return end
+        updT()
+        if Fov then
+            local vp = Cam.ViewportSize
+            Fov.Position = Vector2.new(vp.X*0.5, vp.Y*0.5)
+            if CFG.FOV >= 180 then
+                Fov.Radius = math.max(vp.X, vp.Y)*2
+            else
+                local cf = math.clamp(Cam.FieldOfView, 1, 120)
+                local fo = (vp.Y*0.5)/math.tan(math.rad(cf*0.5))
+                Fov.Radius = fo*math.tan(math.rad(math.min(CFG.FOV, 89.5)))
+            end
+            Fov.Color = CFG.FovColor
+            Fov.Visible = CFG.SilentAim and CFG.DrawFov
+        end
+        local seen = {}
+        local cf = W:FindFirstChild("Characters")
+        if cf and CFG.Chams then
+            for _, ch in ipairs(cf:GetChildren()) do
+                if ch:IsA("Model") and ch.Name ~= LP.Name and isAlive(ch) then
+                    local pl = P:FindFirstChild(ch.Name)
+                    if isEnemy(pl, ch) then
+                        updateChams(ch, true)
+                        seen[ch] = true
+                    end
+                end
+            end
+        end
+        for ch, c in pairs(ChamsCache) do
+            if not seen[ch] then
+                if not ch.Parent then
+                    pcall(function() c:Destroy() end)
+                    ChamsCache[ch] = nil
+                else
+                    if c.Enabled then c.Enabled = false end
+                end
+            end
+        end
+    end)
+end)
+
+-- реинсталл
+task.spawn(function()
+    while task.wait(3) do
+        if CFG.SilentAim and not silentInstalled then pcall(Cheat.InstallSilent) end
+        if CFG.NoRecoil and not recoilState.installed then pcall(Cheat.InstallNoRecoil) end
+        if CFG.NoSpread and not spreadState.installed then pcall(Cheat.InstallNoSpread) end
+        if CFG.InstantReload and not reloadState.installed then pcall(Cheat.InstallInstantReload) end
+    end
+end)
+
+print("[A-mod 2/3] логика готова")
+-- ЧАСТЬ 3/3
+local M = _G.AmodM
+local pg = _G.AmodPG
+local Cheat = _G.AmodCheat
+local CFG = _G.CFG
+if not (pg and M and Cheat and CFG) then warn("[A-mod] запусти части 1 и 2") return end
+
+-- Master: Silent Aim
+local master = M.buildMaster(pg, 9, 48, 261, "Silent Aim", CFG.SilentAim)
+master.onChanged = function(v)
+    CFG.SilentAim = v
+    if v then pcall(Cheat.InstallSilent) end
+end
+
+-- Панель Silent Aim
+M.buildPanel(pg, 9, 85, 261, 296, {
+    {
+        title = "Silent Aim",
+        rows = {
+            { "check", "Draw FOV", CFG.DrawFov },
+            { "slider", "FOV:", 20, 800, CFG.FOV, 0 },
+            { "check", "Team Check", CFG.TeamCheck },
+            { "slider", "Max Dist:", 100, 5000, CFG.MaxDist, 0 },
+        },
+    },
+    {
+        title = "Weapon",
+        rows = {
+            { "check", "No Recoil", CFG.NoRecoil },
+            { "check", "No Spread", CFG.NoSpread },
+            { "check", "Instant Reload", CFG.InstantReload },
+        },
+    },
+})
+
+-- Панель Chams
+M.buildPanel(pg, 278, 48, 292, 333, {
+    {
+        title = "Chams",
+        rows = {
+            { "check", "Chams", CFG.Chams },
+            { "slider", "Transparency:", 0, 100, math.floor(CFG.ChamsTransparency * 100), 0 },
+        },
+    },
+})
+
+-- Привязка
+M.controls["Draw FOV"].onChanged = function(v) CFG.DrawFov = v end
+M.controls["FOV:"].onChanged = function(v) CFG.FOV = v end
+M.controls["Team Check"].onChanged = function(v) CFG.TeamCheck = v end
+M.controls["Max Dist:"].onChanged = function(v) CFG.MaxDist = v end
+M.controls["No Recoil"].onChanged = function(v)
+    CFG.NoRecoil = v
+    if v then pcall(Cheat.InstallNoRecoil) end
+end
+M.controls["No Spread"].onChanged = function(v)
+    CFG.NoSpread = v
+    if v then pcall(Cheat.InstallNoSpread) end
+end
+M.controls["Instant Reload"].onChanged = function(v)
+    CFG.InstantReload = v
+    if v then pcall(Cheat.InstallInstantReload) end
+end
+M.controls["Chams"].onChanged = function(v) CFG.Chams = v end
+M.controls["Transparency:"].onChanged = function(v) CFG.ChamsTransparency = v / 100 end
+
+print("[A-mod 3/3] Combat собран. Функции готовы.")
